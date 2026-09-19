@@ -1,8 +1,9 @@
 # ==============================================================================
 # REAL-WORLD 8-TOPOLOGY COMPARATIVE VISUALIZATION & BENCHMARK SCRIPT
 # Dataset: Base R Air Quality Dataset (New York Ozone Measurements, 1973)
+# Updated: Sequential Density-Gap Estimator (\hat{r}_n) Integration
 # Evaluated Topologies: Normal, Exponential, Cauchy, Beta, Gamma, Weibull, Student_t, Uniform
-# Methods Compared: Proposed Non-Parametric Density, Rosner's ESD, Iterative Grubbs
+# Methods Compared: Proposed Adaptive Density, Rosner's ESD, Iterative Grubbs
 # ==============================================================================
 
 if (!require("EnvStats")) install.packages("EnvStats")
@@ -20,8 +21,7 @@ set.seed(2026)
 data(airquality)
 real_sensor_data <- na.omit(airquality$Ozone)
 
-n_obs       <- length(real_sensor_data) # N = 116
-r_suspected <- 5                        # r = 5 extreme points evaluated
+n_obs <- length(real_sensor_data) # N = 116
 
 topologies <- c("Normal", "Exponential", "Cauchy", "Beta", 
                 "Gamma", "Weibull", "Student_t", "Uniform")
@@ -37,16 +37,51 @@ get_robust_bandwidth <- function(x) {
   return(max(h, 1e-5))
 }
 
-compute_np_density_outliers <- function(x_data, r) {
+#' Estimate r dynamically via Sequential Log-Density Gap Thresholding (Def 2.1)
+estimate_r_hat <- function(densities, n, h, r_max = NULL) {
+  if (is.null(r_max)) {
+    r_max <- max(1, floor(5 * log(n)))
+  }
+  
+  sorted_densities <- sort(densities, decreasing = FALSE)
+  sorted_densities[sorted_densities <= 0] <- .Machine$double.eps
+  
+  # Log-density sequence
+  log_dens <- log(sorted_densities)
+  
+  # Adaptive threshold: tau_n = C_r * sqrt(ln(n) / (n * h_n))
+  C_r <- 1.0
+  tau_n <- C_r * sqrt(log(n) / (n * h))
+  
+  # Sequential log-density gap rule: min { k : ln f(x_{k+1}) - ln f(x_k) < tau_n }
+  r_hat <- r_max
+  for (k in 1:(r_max - 1)) {
+    gap <- log_dens[k + 1] - log_dens[k]
+    if (gap < tau_n) {
+      r_hat <- k
+      break
+    }
+  }
+  return(r_hat)
+}
+
+#' Non-Parametric Density Outlier Detection using Dynamic \hat{r}_n
+compute_np_density_outliers <- function(x_data) {
   n <- length(x_data)
   h <- get_robust_bandwidth(x_data)
   densities <- numeric(n)
+  
   for (i in 1:n) {
     densities[i] <- mean(dnorm((x_data[i] - x_data) / h)) / h
   }
-  threshold_density <- sort(densities)[r]
+  
+  # Estimate r_hat dynamically from the density sequence
+  r_hat <- estimate_r_hat(densities, n, h)
+  
+  threshold_density <- sort(densities)[r_hat]
   flagged_indices   <- which(densities <= threshold_density)
-  return(list(indices = flagged_indices, densities = densities))
+  
+  return(list(indices = flagged_indices, densities = densities, r_hat = r_hat))
 }
 
 run_rosner_esd <- function(x_data, k = 5, alpha = 0.05) {
@@ -92,6 +127,7 @@ heatmap_data <- data.frame(Topology = character(), Method = character(), Count =
 summary_numerical_results <- data.frame(
   Topology             = character(),
   Support_Domain       = character(),
+  Estimated_r_hat      = numeric(),
   NP_Density_Flagged   = numeric(),
   Rosner_ESD_Flagged   = numeric(),
   Grubbs_Flagged       = numeric(),
@@ -104,7 +140,7 @@ summary_numerical_results <- data.frame(
 data_beta_scaled <- (real_sensor_data - min(real_sensor_data) + 0.001) / 
   (max(real_sensor_data) - min(real_sensor_data) + 0.002)
 
-cat("Processing benchmarks across all 8 distribution topologies...\n")
+cat("Processing real-data benchmarks across all 8 topologies using adaptive r_hat...\n")
 
 for (topo in topologies) {
   
@@ -120,10 +156,14 @@ for (topo in topologies) {
                    "Uniform"     = real_sensor_data
   )
   
-  # Outlier Detection
-  np_idx     <- compute_np_density_outliers(x_eval, r_suspected)$indices
-  rosner_idx <- run_rosner_esd(x_eval, k = r_suspected)
-  grubbs_idx <- run_grubbs_iterative(x_eval, max_k = r_suspected)
+  # Outlier Detection using Adaptive r_hat
+  np_res     <- compute_np_density_outliers(x_eval)
+  np_idx     <- np_res$indices
+  r_hat_val  <- np_res$r_hat
+  
+  # Evaluate Rosner & Grubbs using estimated r_hat as upper bound
+  rosner_idx <- run_rosner_esd(x_eval, k = max(r_hat_val, 3))
+  grubbs_idx <- run_grubbs_iterative(x_eval, max_k = max(r_hat_val, 3))
   
   # Quantify Agreement Metrics
   overlap_cnt <- length(intersect(np_idx, rosner_idx))
@@ -134,6 +174,7 @@ for (topo in topologies) {
   summary_numerical_results <- rbind(summary_numerical_results, data.frame(
     Topology             = topo,
     Support_Domain       = switch(topo, "Beta" = "(0, 1)", "Cauchy" = "R (Centered)", "Student_t" = "R (Standardized)", "R+"),
+    Estimated_r_hat      = r_hat_val,
     NP_Density_Flagged   = length(np_idx),
     Rosner_ESD_Flagged   = length(rosner_idx),
     Grubbs_Flagged       = length(grubbs_idx),
@@ -144,8 +185,8 @@ for (topo in topologies) {
   # Append to Heatmap Data
   heatmap_data <- rbind(heatmap_data,
                         data.frame(Topology = topo, Method = "Proposed Density", Count = length(np_idx)),
-                        data.frame(Topology = topo, Method = "Rosner ESD",       Count = length(rosner_idx)),
-                        data.frame(Topology = topo, Method = "Grubbs Test",     Count = length(grubbs_idx))
+                        data.frame(Topology = topo, Method = "Rosner ESD",        Count = length(rosner_idx)),
+                        data.frame(Topology = topo, Method = "Grubbs Test",      Count = length(grubbs_idx))
   )
   
   # Prepare Plotting DataFrame
@@ -165,7 +206,7 @@ for (topo in topologies) {
       "Flagged by Both"       = "#8e44ad"
     )) +
     labs(
-      title = sprintf("Topology: %s", topo),
+      title = sprintf("Topology: %s (r_hat = %d)", topo, r_hat_val),
       x = "Transformed Ozone Domain",
       y = "Density"
     ) +
@@ -184,8 +225,7 @@ grid_graphic <- grid.arrange(
   plot_list[["Cauchy"]], plot_list[["Beta"]],
   plot_list[["Gamma"]],  plot_list[["Weibull"]],
   plot_list[["Student_t"]], plot_list[["Uniform"]],
-  ncol = 2,
-  top = ""
+  ncol = 2
 )
 
 ggsave("real_world_8topology_densities.png", plot = grid_graphic, width = 11, height = 11, dpi = 300)
@@ -195,8 +235,7 @@ p_heatmap <- ggplot(heatmap_data, aes(x = Topology, y = Method, fill = Count)) +
   geom_text(aes(label = Count), color = "black", fontface = "bold", size = 5) +
   scale_fill_gradient(low = "#ebf5fb", high = "#3498db") +
   labs(
-    title = "",
-    subtitle = "",
+    title = expression("Outlier Detection Concordance Across Methods with Adaptive " * hat(r)[n]),
     x = "Distribution Topology",
     y = "Detection Algorithm"
   ) +
@@ -214,7 +253,7 @@ ggsave("real_world_method_concordance.png", plot = p_heatmap, width = 8, height 
 # ------------------------------------------------------------------------------
 
 cat("\n========================================================================================\n")
-cat("   SUMMARY NUMERICAL RESULTS: REAL-WORLD DATASET ACROSS ALL 8 DISTRIBUTION TOPOLOGIES  \n")
+cat("   SUMMARY NUMERICAL RESULTS: REAL-WORLD DATASET ACROSS ALL 8 TOPOLOGIES (ADAPTIVE r_hat) \n")
 cat("========================================================================================\n")
 print(summary_numerical_results, row.names = FALSE)
 cat("========================================================================================\n")
